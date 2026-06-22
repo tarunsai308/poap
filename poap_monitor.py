@@ -40,30 +40,26 @@ from openpyxl.utils import get_column_letter
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-
-#  SECTION 1 — CONFIG
-
+#  SECTION 1 — CONFIG  ← edit the values below to match your setup
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-POAP_FILE            = os.path.join(BASE_DIR, "LDC_R4.0_Mock2_EU_LoadPlan.xlsx")
+# -- Excel POAP Plan ----------------------------------------------------------
+POAP_FILE  = os.path.join(BASE_DIR, "LDC_R4.0_Mock2_EU_LoadPlan.xlsx")  # Excel file name
+POAP_SHEET = "POAP-Mock1"                                                 # Tab name containing POAP objects
 
-POAP_SHEET           = "2. Load Plan-EU"          # name of the POAP tab in the Excel file
+# -- Outlook Email Scanning ---------------------------------------------------
+EMAIL_SUBJECT_PREFIX = "LDC R4.0 : MOCK2 : EU"   # emails must contain this string in subject
+OUTLOOK_FOLDER       = ""                          # optional: e.g. "Archive/R4 Mock2 EU"
+                                                   # leave empty ("") to scan entire mailbox
+LOOKBACK_DAYS        = 90                          # days back to scan on first run
 
-EMAIL_SUBJECT_PREFIX = "LDC R4.0 : MOCK2 : EU"
-
+# -- General ------------------------------------------------------------------
 MAX_EMAILS_PER_CHAIN = 10
-
-SCAN_ROOT_FOLDERS    = ["Inbox", "Archive","R4 Mock2 EU"]
-
-LOOKBACK_DAYS        = 90
-
+POLL_SECONDS         = 60       # continuous mode polling interval (seconds)
+DUE_HOURS            = 3        # hours after last email before status turns Due
 CACHE_OVERLAP_MINS   = 10       # safety overlap on incremental scans
-
-POLL_SECONDS         = 60       # continuous mode interval
-
-DUE_HOURS            = 3        # hours after last email before status becomes Due
 
 OUTPUT_EXCEL     = os.path.join(BASE_DIR, "POAP_Status_Dashboard.xlsx")
 
@@ -166,25 +162,39 @@ def load_objects():
 
         )
 
+    poap_col = {}
+
     for i, row in enumerate(wb[POAP_SHEET].iter_rows(values_only=True)):
 
-        if i < 6: continue
+        if i < 5: continue
 
-        oid = row[1]
+        if i == 5:
+            poap_col = {str(c).strip().upper(): j for j, c in enumerate(row) if c}
+            missing  = [n for n in ('ID', 'DATA OBJECT', 'GDME', 'EU DDME', 'STREAM', 'ST. WEEK')
+                        if n not in poap_col]
+            if missing:
+                print(f'  WARNING: POAP sheet missing expected columns: {missing}')
+            continue
 
-        if not oid or not isinstance(oid, str) or oid in ('ID', 'FIN'): continue
+        def _pc(name, fallback):
+            idx = poap_col.get(name, fallback)
+            return str(row[idx]).strip() if idx < len(row) and row[idx] else ''
+
+        oid = _pc('ID', 1)
+
+        if not oid or oid in ('ID', 'FIN'): continue
 
         objects[oid] = {
 
-            'name':            str(row[2]).strip() if row[2] else oid,
+            'name':            _pc('DATA OBJECT', 2) or oid,
 
-            'stream':          str(row[6]).strip() if row[6] else '',
+            'stream':          _pc('STREAM', 6),
 
-            'owner_gdme':      str(row[3]).strip() if row[3] else '',
+            'owner_gdme':      _pc('GDME', 3),
 
-            'owner_eu':        str(row[4]).strip() if row[4] else '',
+            'owner_eu':        _pc('EU DDME', 4),
 
-            'start_week':      str(row[9]).strip() if row[9] else '',
+            'start_week':      _pc('ST. WEEK', 9),
 
             'activities':      {},
 
@@ -633,9 +643,36 @@ def _scan_folder(folder, cutoff, prefix_upper, known_ids, bucket):
 
         pass
  
+def _get_folder_by_path(namespace, path):
+    """Navigate to an Outlook folder by slash-separated path across all stores."""
+    parts = [p.strip() for p in path.replace('\\', '/').split('/') if p.strip()]
+    if not parts: return None
+    candidates = []
+    try:
+        for store in namespace.Stores:
+            try:
+                for f in store.GetRootFolder().Folders: candidates.append(f)
+            except Exception: pass
+    except Exception:
+        try:
+            for f in namespace.Folders: candidates.append(f)
+        except Exception: pass
+    current = next((f for f in candidates if f.Name.upper() == parts[0].upper()), None)
+    if current is None: return None
+    for part in parts[1:]:
+        found = None
+        try:
+            for sf in current.Folders:
+                if sf.Name.upper() == part.upper(): found = sf; break
+        except Exception: return None
+        if found is None: return None
+        current = found
+    return current
+
+
 def get_new_emails(known_ids=None, since_dt=None):
 
-    """Scan ALL Outlook folders/subfolders from since_dt onward. Returns {obj_id: [emails]} newest-first."""
+    """Scan Outlook folders from since_dt onward. Returns {obj_id: [emails]} newest-first."""
 
     import win32com.client
 
@@ -649,40 +686,34 @@ def get_new_emails(known_ids=None, since_dt=None):
 
     bucket       = {}
 
-    try:
+    if OUTLOOK_FOLDER.strip():
+        root = _get_folder_by_path(namespace, OUTLOOK_FOLDER.strip())
+        if root:
+            print(f'      Scanning folder: {OUTLOOK_FOLDER}')
+            _scan_folder(root, cutoff, prefix_upper, known_ids, bucket)
+        else:
+            print(f'  Warning: folder "{OUTLOOK_FOLDER}" not found — falling back to full mailbox scan.')
 
-        for store in namespace.Stores:
-
-            try:
-
-                for folder in store.GetRootFolder().Folders:
-
-                    _scan_folder(folder, cutoff, prefix_upper, known_ids, bucket)
-
-            except Exception as e:
-
-                print(f'  Warning: could not scan store "{getattr(store, "DisplayName", "?")}": {e}')
-
-    except Exception:
-
-        # Fallback: use namespace.Folders if Stores is unavailable
-
-        for fname in SCAN_ROOT_FOLDERS:
-
-            fid = _FOLDER_IDS.get(fname)
-
-            try:
-
-                root = namespace.GetDefaultFolder(fid) if fid else None
-
-                if root: _scan_folder(root, cutoff, prefix_upper, known_ids, bucket)
-
-            except Exception as e:
-
-                print(f'  Warning: could not scan "{fname}": {e}')
+    else:
+        # No specific folder set — scan entire mailbox across all stores
+        try:
+            for store in namespace.Stores:
+                try:
+                    for folder in store.GetRootFolder().Folders:
+                        _scan_folder(folder, cutoff, prefix_upper, known_ids, bucket)
+                except Exception as e:
+                    print(f'  Warning: could not scan store "{getattr(store, "DisplayName", "?")}": {e}')
+        except Exception:
+            # Fallback for older Outlook versions
+            for fname in SCAN_ROOT_FOLDERS:
+                fid = _FOLDER_IDS.get(fname)
+                try:
+                    root = namespace.GetDefaultFolder(fid) if fid else None
+                    if root: _scan_folder(root, cutoff, prefix_upper, known_ids, bucket)
+                except Exception as e:
+                    print(f'  Warning: could not scan "{fname}": {e}')
 
     for oid in bucket:
-
         bucket[oid].sort(key=lambda e: e['date'], reverse=True)
 
     return bucket
